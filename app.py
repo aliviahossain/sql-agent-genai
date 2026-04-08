@@ -1,10 +1,19 @@
 from flask import Flask, request, jsonify, send_from_directory
-import google.generativeai as genai
-import sqlite3, os, json, re
+from openai import OpenAI
+import sqlite3, os, json, re, csv, io
+from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+
+load_dotenv()
 
 app = Flask(__name__)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-model = genai.GenerativeModel("gemini-1.5-flash")
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+ALLOWED_EXTENSIONS = {'csv'}
+
+client = OpenAI(
+    api_key="ollama",
+    base_url="http://localhost:11434/v1"
+)
 
 DB = os.path.join(os.path.expanduser("~"), "business.db")
 
@@ -103,13 +112,31 @@ def run_sql(query):
         conn.close()
         return {"success": False, "error": str(e)}
 
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 @app.route("/")
 def root():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
+@app.route("/api/health")
+def health_check():
+    try:
+        test_response = client.chat.completions.create(
+            model="mistral",
+            messages=[{"role": "user", "content": "Say 'OK'"}],
+            max_tokens=10
+        )
+        return jsonify({"status": "healthy", "ollama": "running"})
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "ollama": "not running", "error": str(e)}), 503
+
 @app.route("/api/schema")
 def api_schema():
-    return jsonify(get_schema())
+    try:
+        return jsonify(get_schema())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/suggestions")
 def api_suggestions():
@@ -143,23 +170,147 @@ Question: {question}
 Return ONLY the SQL query. No markdown, no explanation, no backticks."""
 
     try:
-        sql = re.sub(r'```sql|```', '', model.generate_content(prompt).text.strip()).strip()
+        response = client.chat.completions.create(
+            model="mistral",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        sql = re.sub(r'```sql|```', '', response.choices[0].message.content.strip()).strip()
         result = run_sql(sql)
+
         if not result["success"]:
             fix = f"Fix this SQLite SQL: {sql}\nError: {result['error']}\nReturn only fixed SQL."
-            sql = re.sub(r'```sql|```', '', model.generate_content(fix).text.strip()).strip()
+            fix_response = client.chat.completions.create(
+                model="mistral",
+                messages=[{"role": "user", "content": fix}],
+                temperature=0
+            )
+            sql = re.sub(r'```sql|```', '', fix_response.choices[0].message.content.strip()).strip()
             result = run_sql(sql)
 
         explanation = ""
         if result["success"] and result["data"]:
             ep = f'Question: "{question}"\nSQL: {sql}\nSample: {json.dumps(result["data"][:3])}\nRows: {result["count"]}\nExplain in 1-2 sentences with numbers.'
-            explanation = model.generate_content(ep).text.strip()
+            exp_response = client.chat.completions.create(
+                model="mistral",
+                messages=[{"role": "user", "content": ep}],
+                temperature=0
+            )
+            explanation = exp_response.choices[0].message.content.strip()
         elif result["success"]:
             explanation = "The query returned no results."
 
         return jsonify({"sql": sql, "result": result, "explanation": explanation})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e)
+        if "Connection refused" in error_msg or "localhost:11434" in error_msg:
+            return jsonify({"error": "Ollama is not running. Please start Ollama with: ollama run mistral"}), 503
+        return jsonify({"error": f"AI service error: {error_msg}"}), 500
+
+@app.route("/api/upload", methods=["POST"])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files['file']
+    table_name = request.form.get('table_name', '').strip()
+
+    if not table_name:
+        return jsonify({"error": "Table name is required"}), 400
+
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+        return jsonify({"error": "Table name can only contain letters, numbers, and underscores, and must start with a letter or underscore"}), 400
+
+    if not file or file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({"error": "Only CSV files are supported. Please upload a .csv file"}), 400
+
+    try:
+        raw = file.read()
+        # Try UTF-8 with BOM first, then fallback to latin-1
+        try:
+            content = raw.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            content = raw.decode('latin-1')
+
+        reader = csv.DictReader(io.StringIO(content))
+        rows = list(reader)
+
+        if not rows:
+            return jsonify({"error": "The CSV file is empty or has no data rows"}), 400
+
+        cols = list(reader.fieldnames)
+        if not cols:
+            return jsonify({"error": "Could not detect column headers in the CSV"}), 400
+
+        if len(rows) > 100000:
+            return jsonify({"error": "File exceeds 100,000 row limit"}), 400
+
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+
+        # Drop existing table with same name and recreate
+        c.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+        # Create table — all columns as TEXT; user can cast in SQL
+        col_defs = ", ".join(f'"{col.strip()}" TEXT' for col in cols)
+        c.execute(f'CREATE TABLE "{table_name}" ({col_defs})')
+
+        placeholders = ", ".join("?" * len(cols))
+        clean_cols = [col.strip() for col in cols]
+        c.executemany(
+            f'INSERT INTO "{table_name}" VALUES ({placeholders})',
+            [tuple(row.get(col, '') for col in cols) for row in rows]
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "rows": len(rows),
+            "columns": clean_cols,
+            "table": table_name
+        })
+
+    except csv.Error as e:
+        return jsonify({"error": f"CSV parsing error: {str(e)}"}), 400
+    except sqlite3.Error as e:
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+@app.route("/api/detect-chart", methods=["POST"])
+def detect_chart():
+    data = request.get_json()
+    result = data.get("result", {})
+
+    if not result.get("success") or not result.get("data"):
+        return jsonify({"chart_type": None})
+
+    rows = result["data"]
+    columns = result["columns"]
+
+    if len(columns) == 2 and len(rows) <= 50:
+        first_col_vals = [row.get(columns[0]) for row in rows]
+        second_col_vals = [row.get(columns[1]) for row in rows]
+        numeric_count = sum(1 for v in second_col_vals if isinstance(v, (int, float)))
+        if numeric_count >= len(rows) * 0.8:
+            chart_data = {
+                "type": "bar",
+                "labels": [str(v) for v in first_col_vals],
+                "datasets": [{
+                    "label": columns[1],
+                    "data": [float(v) if isinstance(v, (int, float)) else 0 for v in second_col_vals],
+                    "backgroundColor": "rgba(0, 212, 170, 0.6)",
+                    "borderColor": "rgba(0, 212, 170, 1)",
+                    "borderWidth": 1
+                }]
+            }
+            return jsonify({"chart_type": "bar", "chart_data": chart_data})
+
+    return jsonify({"chart_type": None})
 
 if __name__ == "__main__":
     app.run(debug=True, port=8080)
